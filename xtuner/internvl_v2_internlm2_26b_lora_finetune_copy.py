@@ -1,123 +1,91 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch
-from datasets import load_dataset
-from mmengine.dataset import DefaultSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
                             LoggerHook, ParamSchedulerHook)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
 from peft import LoraConfig
 from torch.optim import AdamW
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig)
+from transformers import AutoTokenizer
 
-from xtuner.dataset import process_hf_dataset
+from xtuner.dataset import InternVL_V1_5_Dataset
 from xtuner.dataset.collate_fns import default_collate_fn
-from xtuner.dataset.map_fns import alpaca_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import (DatasetInfoHook, EvaluateChatHook,
-                                 VarlenAttnArgsToMessageHubHook)
+from xtuner.dataset.samplers import LengthGroupedSampler
+from xtuner.engine.hooks import DatasetInfoHook
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import SupervisedFinetune
-from xtuner.parallel.sequence import SequenceParallelSampler
-from xtuner.utils import PROMPT_TEMPLATE, SYSTEM_TEMPLATE
+from xtuner.model import InternVL_V1_5
+from xtuner.utils import PROMPT_TEMPLATE
 
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-pretrained_model_name_or_path = '/home/scy/models/Shanghai_AI_Laboratory/internlm2-chat-1_8b'
-use_varlen_attn = False
+path = '/home/scy/models/OpenGVLab/InternVL2-2B'
 
 # Data
-alpaca_en_path = './datas/assistant.json'
+data_root = '/home/scy/datasets/CLoT_cn_2000/'
+data_path = data_root + 'ex_cn.json'
+image_folder = data_root
 prompt_template = PROMPT_TEMPLATE.internlm2_chat
-max_length = 2048
-pack_to_max_length = True
-
-# parallel
-sequence_parallel_size = 1
+max_length = 8192
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 16
-accumulative_counts *= sequence_parallel_size
-dataloader_num_workers = 0
-max_epochs = 3
+accumulative_counts = 4
+dataloader_num_workers = 4
+max_epochs = 1
 optim_type = AdamW
-lr = 2e-4
+# official 1024 -> 4e-5
+lr = 1e-6
 betas = (0.9, 0.999)
-weight_decay = 0
+weight_decay = 0.05
 max_norm = 1  # grad clip
 warmup_ratio = 0.03
 
 # Save
-save_steps = 500
-save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
-
-# Evaluate the generation performance during the training
-evaluation_freq = 500
-SYSTEM = SYSTEM_TEMPLATE.alpaca
-evaluation_inputs = [
-    '请介绍一下你自己', 'Please introduce yourself'
-]
+save_steps = 1000
+save_total_limit = 1  # Maximum checkpoints to keep (-1 means unlimited)
 
 #######################################################################
-#                      PART 2  Model & Tokenizer                      #
+#            PART 2  Model & Tokenizer & Image Processor              #
 #######################################################################
-tokenizer = dict(
-    type=AutoTokenizer.from_pretrained,
-    pretrained_model_name_or_path=pretrained_model_name_or_path,
-    trust_remote_code=True,
-    padding_side='right')
-
 model = dict(
-    type=SupervisedFinetune,
-    use_varlen_attn=use_varlen_attn,
-    llm=dict(
-        type=AutoModelForCausalLM.from_pretrained,
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        quantization_config=dict(
-            type=BitsAndBytesConfig,
-            load_in_4bit=True,
-            load_in_8bit=False,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type='nf4')),
-    lora=dict(
+    type=InternVL_V1_5,
+    model_path=path,
+    freeze_llm=True,
+    freeze_visual_encoder=True,
+    # comment the following lines if you don't want to use Lora in llm
+    llm_lora=dict(
         type=LoraConfig,
-        r=64,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        bias='none',
-        task_type='CAUSAL_LM'))
+        r=128,
+        lora_alpha=256,
+        lora_dropout=0.05,
+        target_modules=None,
+        task_type='CAUSAL_LM'),
+    # uncomment the following lines if you don't want to use Lora in visual encoder # noqa
+    # visual_encoder_lora=dict(
+    #     type=LoraConfig, r=64, lora_alpha=16, lora_dropout=0.05,
+    #     target_modules=['attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'])
+)
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
-alpaca_en = dict(
-    type=process_hf_dataset,
-    dataset=dict(type=load_dataset, path='json', data_files=dict(train=alpaca_en_path)),
-    tokenizer=tokenizer,
-    max_length=max_length,
-    dataset_map_fn=None,
-    template_map_fn=dict(
-        type=template_map_fn_factory, template=prompt_template),
-    remove_unused_columns=True,
-    shuffle_before_pack=True,
-    pack_to_max_length=pack_to_max_length,
-    use_varlen_attn=use_varlen_attn)
+llava_dataset = dict(
+    type=InternVL_V1_5_Dataset,
+    model_path=path,
+    data_paths=data_path,
+    image_folders=image_folder,
+    template=prompt_template,
+    max_length=max_length)
 
-sampler = SequenceParallelSampler \
-    if sequence_parallel_size > 1 else DefaultSampler
 train_dataloader = dict(
     batch_size=batch_size,
     num_workers=dataloader_num_workers,
-    dataset=alpaca_en,
-    sampler=dict(type=sampler, shuffle=True),
-    collate_fn=dict(type=default_collate_fn, use_varlen_attn=use_varlen_attn))
+    dataset=llava_dataset,
+    sampler=dict(
+        type=LengthGroupedSampler,
+        length_property='modality_length',
+        per_device_batch_size=batch_size * accumulative_counts),
+    collate_fn=dict(type=default_collate_fn))
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -158,19 +126,14 @@ train_cfg = dict(type=TrainLoop, max_epochs=max_epochs)
 #                           PART 5  Runtime                           #
 #######################################################################
 # Log the dialogue periodically during the training process, optional
+tokenizer = dict(
+    type=AutoTokenizer.from_pretrained,
+    pretrained_model_name_or_path=path,
+    trust_remote_code=True)
+
 custom_hooks = [
     dict(type=DatasetInfoHook, tokenizer=tokenizer),
-    dict(
-        type=EvaluateChatHook,
-        tokenizer=tokenizer,
-        every_n_iters=evaluation_freq,
-        evaluation_inputs=evaluation_inputs,
-        system=SYSTEM,
-        prompt_template=prompt_template)
 ]
-
-if use_varlen_attn:
-    custom_hooks += [dict(type=VarlenAttnArgsToMessageHubHook)]
 
 # configure default hooks
 default_hooks = dict(
@@ -183,6 +146,7 @@ default_hooks = dict(
     # save checkpoint per `save_steps`.
     checkpoint=dict(
         type=CheckpointHook,
+        save_optimizer=False,
         by_epoch=False,
         interval=save_steps,
         max_keep_ckpts=save_total_limit),
